@@ -9,14 +9,15 @@ const https = require("https");
 
 // ─── CONFIG ────────────────────────────────────────────────
 const CONFIG = {
-  TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID || "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-  TWILIO_API_KEY_SID: process.env.TWILIO_API_KEY_SID || "SKxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-  TWILIO_API_SECRET:  process.env.TWILIO_API_SECRET  || "your_api_secret_here",
-  TWILIO_FROM_NUMBER: process.env.TWILIO_FROM_NUMBER || "+1XXXXXXXXXX",
-  TO_NUMBER:          process.env.TO_NUMBER          || "+1XXXXXXXXXX",
+  // Gmail credentials — set these in GitHub Secrets
+  GMAIL_USER:     process.env.GMAIL_USER     || "you@gmail.com",
+  GMAIL_APP_PASS: process.env.GMAIL_APP_PASS || "your_app_password_here",
 
-  // Add more numbers here — everyone gets the same text
-  EXTRA_NUMBERS: [], // e.g. ["+19175559999"]
+  // Your AT&T number — digits only, no dashes or spaces
+  TO_NUMBER: process.env.TO_NUMBER || "9175551234",
+
+  // Add extra AT&T numbers if needed
+  EXTRA_NUMBERS: [], // e.g. ["9175559999"]
 
   // ZIP 10065 — Upper East Side, NYC
   LATITUDE:  40.7648,
@@ -323,49 +324,58 @@ Have a great week! 🗽`
 }
 
 
-// ─── TWILIO SENDER ──────────────────────────────────────────
+// ─── EMAIL TO TEXT SENDER ───────────────────────────────────
+// Gmail SMTP → AT&T gateway (number@txt.att.net) → arrives as SMS
 
-function sendSMS(to, message) {
+function sendEmail(toAddress, body) {
   return new Promise((resolve, reject) => {
-    const body = new URLSearchParams({
-      To:   to,
-      From: CONFIG.TWILIO_FROM_NUMBER,
-      Body: message,
-    }).toString();
+    const tls = require("tls");
 
-    const auth = Buffer.from(
-      `${CONFIG.TWILIO_API_KEY_SID}:${CONFIG.TWILIO_API_SECRET}`
-    ).toString("base64");
+    const rawEmail = [
+      `From: ${CONFIG.GMAIL_USER}`,
+      `To: ${toAddress}`,
+      `Subject: NYC Weather`,
+      `MIME-Version: 1.0`,
+      `Content-Type: text/plain; charset=utf-8`,
+      ``,
+      body,
+    ].join("
+");
 
-    const options = {
-      hostname: "api.twilio.com",
-      path:     `/2010-04-01/Accounts/${CONFIG.TWILIO_ACCOUNT_SID}/Messages.json`,
-      method:   "POST",
-      headers: {
-        "Content-Type":   "application/x-www-form-urlencoded",
-        "Authorization":  `Basic ${auth}`,
-        "Content-Length": Buffer.byteLength(body),
-      },
-    };
+    const socket = tls.connect(465, "smtp.gmail.com", { rejectUnauthorized: true }, () => {
+      let step = 0;
+      let buffer = "";
 
-    const req = https.request(options, (res) => {
-      let raw = "";
-      res.on("data", (c) => (raw += c));
-      res.on("end", () => {
-        const parsed = JSON.parse(raw);
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve(parsed);
-        } else {
-          reject(new Error(`Twilio error ${res.statusCode}: ${parsed.message}`));
-        }
+      const send = (cmd) => {
+        socket.write(cmd + "
+");
+      };
+
+      socket.on("data", (data) => {
+        buffer += data.toString();
+        if (!buffer.endsWith("
+")) return;
+        const line = buffer.trim();
+        buffer = "";
+
+        if      (step === 0 && line.startsWith("220")) { step++; send("EHLO smtp.gmail.com"); }
+        else if (step === 1 && line.includes("250 "))  { step++; send("AUTH LOGIN"); }
+        else if (step === 2 && line.startsWith("334")) { step++; send(Buffer.from(CONFIG.GMAIL_USER).toString("base64")); }
+        else if (step === 3 && line.startsWith("334")) { step++; send(Buffer.from(CONFIG.GMAIL_APP_PASS).toString("base64")); }
+        else if (step === 4 && line.startsWith("235")) { step++; send(`MAIL FROM:<${CONFIG.GMAIL_USER}>`); }
+        else if (step === 5 && line.startsWith("250")) { step++; send(`RCPT TO:<${toAddress}>`); }
+        else if (step === 6 && line.startsWith("250")) { step++; send("DATA"); }
+        else if (step === 7 && line.startsWith("354")) { step++; send(rawEmail + "
+."); }
+        else if (step === 8 && line.startsWith("250")) { send("QUIT"); socket.destroy(); resolve(); }
+        else if (line.startsWith("5"))                 { reject(new Error(`SMTP error: ${line}`)); socket.destroy(); }
       });
-    });
 
-    req.on("error", reject);
-    req.write(body);
-    req.end();
+      socket.on("error", reject);
+    });
   });
 }
+
 
 
 // ─── MAIN ───────────────────────────────────────────────────
@@ -385,19 +395,21 @@ async function main() {
     console.log(message);
     console.log("─".repeat(50) + "\n");
 
-    const recipients = [CONFIG.TO_NUMBER, ...CONFIG.EXTRA_NUMBERS].filter(
-      (n) => n && !n.includes("XXXXXXXXXX")
+    const allNumbers = [CONFIG.TO_NUMBER, ...CONFIG.EXTRA_NUMBERS].filter(
+      (n) => n && n !== "9175551234"
     );
 
-    if (recipients.length === 0) {
+    if (allNumbers.length === 0) {
       console.log("⚠️  No phone numbers configured — preview only.");
-      console.log("    Set CONFIG.TO_NUMBER to start sending.\n");
+      console.log("    Set TO_NUMBER in GitHub Secrets (digits only).\n");
       return;
     }
 
-    for (const number of recipients) {
-      console.log(`📱 Sending to ${number}...`);
-      await sendSMS(number, message);
+    for (const number of allNumbers) {
+      // Support full email addresses for other carriers, otherwise use AT&T gateway
+      const toAddr = number.includes("@") ? number : `${number.replace(/\D/g, "")}@txt.att.net`;
+      console.log(`📱 Sending to ${toAddr}...`);
+      await sendEmail(toAddr, message);
       console.log("✅ Sent!");
     }
 
